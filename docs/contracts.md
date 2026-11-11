@@ -6,6 +6,16 @@ read out of Rust: a client mapping a failure to a user-facing message, and an
 indexer decoding an event, should not need to compile the contract to know what
 code `7` means or what the third topic is.
 
+> **Machine-readable version available.**
+> [`docs/protocol-changelog.json`](./protocol-changelog.json) is a
+> JSON document that encodes the full protocol behavior — entry points, error
+> codes, state-machine transitions, event shapes, and retry/authorization
+> semantics — following the schema in
+> [`docs/protocol-changelog.schema.json`](./protocol-changelog.schema.json).
+> `@stellar-starter-kit/utils` exports a typed loader and an
+> `assertChangelogIntegrity()` function whose invariants are verified by the
+> test suite in `packages/utils/src/protocol-changelog.test.ts`.
+
 The Rust source is the source of truth. If this page and `contracts/*/src/lib.rs`
 disagree, the source wins and this page has a bug — please open an issue.
 

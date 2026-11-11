@@ -3,6 +3,8 @@
  * All monetary math is done with `bigint` to avoid IEEE-754 precision loss.
  */
 
+export * from './protocol-changelog.js';
+
 /** Decimal places of native XLM and of every Stellar Asset Contract (SAC). */
 export const XLM_DECIMALS = 7;
 

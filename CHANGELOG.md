@@ -39,6 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `docs/protocol-changelog.json`: machine-readable protocol changelog covering all three contracts
+  (`stream`, `splits`, `escrow`) with every entry point's normal path, failure paths (error codes),
+  retry semantics, authorization rules, state-machine transitions, and event shapes. Validated
+  against `docs/protocol-changelog.schema.json`.
+- `@stellar-starter-kit/utils` exports `getProtocolChangelog`, `assertChangelogIntegrity`, and
+  query helpers (`lookupErrorCode`, `getRetryableErrorCodes`, `getHardFailureCodes`,
+  `getTerminalStates`, `getAuthenticatedEntryPoints`) backed by the JSON document.
+- `packages/utils/src/protocol-changelog.test.ts`: 70+ Vitest tests verifying normal paths,
+  failure paths, retry/authorization paths, state-machine invariants, retired error codes, and
+  cross-contract conventions. Acts as the executable verification required by the spec.
+
 - `escrow` contract id allocation: `create_escrow` now takes no `id`, assigns one from a `NextId`
   counter in instance storage and returns it, and a new `next_escrow_id()` view reports the id the
   next creation will receive. Every creation TTL-bumps the instance entry holding the counter.

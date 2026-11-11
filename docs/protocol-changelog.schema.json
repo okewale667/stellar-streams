@@ -1,0 +1,204 @@
+{
+  "title": "StellarStreams Protocol Changelog",
+  "description": "Machine-readable changelog describing the protocol behavior of the Stellar Streams contracts (stream, splits, escrow). Covers normal paths, failure paths, retry semantics, and authorization rules.",
+  "type": "object",
+  "required": ["schemaVersion", "protocolVersion", "generatedAt", "contracts"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "description": "Semver of this schema document."
+    },
+    "protocolVersion": {
+      "type": "integer",
+      "description": "Value of CONTRACT_VERSION shared by all contracts (from contracts/version/src/lib.rs).",
+      "minimum": 1
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date",
+      "description": "ISO 8601 date this document was last updated."
+    },
+    "contracts": {
+      "type": "object",
+      "description": "Per-contract behavior definitions keyed by contract name.",
+      "required": ["stream", "splits", "escrow"],
+      "additionalProperties": false,
+      "properties": {
+        "stream": { "$ref": "#/definitions/ContractSpec" },
+        "splits": { "$ref": "#/definitions/ContractSpec" },
+        "escrow": { "$ref": "#/definitions/ContractSpec" }
+      }
+    }
+  },
+  "definitions": {
+    "ContractSpec": {
+      "type": "object",
+      "required": ["name", "rustStruct", "entryPoints", "errorCodes", "events", "stateMachine"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "rustStruct": { "type": "string" },
+        "description": { "type": "string" },
+        "entryPoints": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/EntryPoint" }
+        },
+        "errorCodes": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ErrorCode" }
+        },
+        "events": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/EventSpec" }
+        },
+        "stateMachine": { "$ref": "#/definitions/StateMachine" }
+      }
+    },
+    "EntryPoint": {
+      "type": "object",
+      "required": ["name", "auth", "paths"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "type": "string" },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "returns": { "type": "string" },
+        "auth": {
+          "type": "object",
+          "required": ["required", "actor"],
+          "additionalProperties": false,
+          "properties": {
+            "required": { "type": "boolean" },
+            "actor": { "type": "string" },
+            "notes": { "type": "string" }
+          }
+        },
+        "paths": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/BehaviorPath" }
+        }
+      }
+    },
+    "BehaviorPath": {
+      "type": "object",
+      "required": ["kind", "description"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["normal", "failure", "retry", "authorization"]
+        },
+        "description": { "type": "string" },
+        "precondition": { "type": "string" },
+        "postcondition": { "type": "string" },
+        "errorCode": { "type": "integer" },
+        "errorVariant": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "retryNotes": { "type": "string" },
+        "emitsEvent": { "type": "string" }
+      }
+    },
+    "ErrorCode": {
+      "type": "object",
+      "required": ["code", "variant", "meaning"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "integer", "minimum": 1 },
+        "variant": { "type": "string" },
+        "meaning": { "type": "string" },
+        "retryable": {
+          "type": "boolean",
+          "description": "True if the caller may retry the same call without changing arguments."
+        },
+        "retired": {
+          "type": "boolean",
+          "description": "True if the discriminant is reserved but never returned."
+        }
+      }
+    },
+    "EventSpec": {
+      "type": "object",
+      "required": ["topics", "dataFields", "publishedBy"],
+      "additionalProperties": false,
+      "properties": {
+        "topics": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "dataFields": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "type": "string" }
+            }
+          }
+        },
+        "publishedBy": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "notes": { "type": "string" }
+      }
+    },
+    "StateMachine": {
+      "type": "object",
+      "required": ["states", "transitions"],
+      "additionalProperties": false,
+      "properties": {
+        "states": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "terminal": { "type": "boolean" },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "transitions": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/Transition" }
+        }
+      }
+    },
+    "Transition": {
+      "type": "object",
+      "required": ["from", "to", "trigger", "authorizedCallers"],
+      "additionalProperties": false,
+      "properties": {
+        "from": { "type": "string" },
+        "to": { "type": "string" },
+        "trigger": { "type": "string" },
+        "authorizedCallers": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "precondition": { "type": "string" },
+        "errorOnPreconditionFail": { "type": "integer" },
+        "errorVariantOnPreconditionFail": { "type": "string" },
+        "tokenTransfer": { "type": "string" },
+        "emitsEvent": { "type": "string" }
+      }
+    }
+  }
+}

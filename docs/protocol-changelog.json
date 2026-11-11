@@ -1,0 +1,1052 @@
+{
+  "schemaVersion": "1.0.0",
+  "protocolVersion": 1,
+  "generatedAt": "2026-11-11",
+  "contracts": {
+    "stream": {
+      "name": "stream",
+      "rustStruct": "StreamContract",
+      "description": "Linear payment streaming with optional cliff, batch creation, protocol fee, and recipient transfer. Source of truth: contracts/stream/src/lib.rs.",
+      "entryPoints": [
+        {
+          "name": "initialize",
+          "description": "One-time setup of the protocol admin, treasury, and fee (in basis points, capped at 10%).",
+          "args": [
+            { "name": "admin", "type": "Address" },
+            { "name": "treasury", "type": "Address" },
+            { "name": "fee_bps", "type": "u32", "description": "Protocol fee in basis points (0–1000)." }
+          ],
+          "returns": "Result<(), StreamError>",
+          "auth": { "required": true, "actor": "admin", "notes": "admin must sign; a second call fails with AlreadyInitialized." },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Admin, treasury, and fee stored; instance TTL bumped.",
+              "precondition": "DataKey::Admin not yet present",
+              "postcondition": "DataKey::Admin, DataKey::Treasury, DataKey::Fee written; instance TTL extended.",
+              "emitsEvent": "none"
+            },
+            {
+              "kind": "failure",
+              "description": "Contract has already been initialized.",
+              "precondition": "DataKey::Admin already present",
+              "errorCode": 9,
+              "errorVariant": "AlreadyInitialized",
+              "retryable": false
+            },
+            {
+              "kind": "failure",
+              "description": "fee_bps exceeds the 10% cap (1000 BPS).",
+              "precondition": "fee_bps > 1000",
+              "errorCode": 7,
+              "errorVariant": "InvalidFee",
+              "retryable": true,
+              "retryNotes": "Retry with fee_bps <= 1000."
+            },
+            {
+              "kind": "authorization",
+              "description": "Missing or wrong admin signature.",
+              "precondition": "admin.require_auth() fails at host level",
+              "errorCode": null,
+              "errorVariant": "Soroban Context error (not a StreamError)",
+              "retryable": true,
+              "retryNotes": "Resubmit with a correctly signed transaction."
+            }
+          ]
+        },
+        {
+          "name": "create_stream",
+          "description": "Lock tokens for a single linear vesting stream. The contract assigns an auto-incrementing id.",
+          "args": [
+            { "name": "sender", "type": "Address", "description": "Funder; must sign." },
+            { "name": "recipient", "type": "Address" },
+            { "name": "token", "type": "Address", "description": "SEP-41 token contract." },
+            { "name": "amount", "type": "i128", "description": "Total tokens in smallest unit." },
+            { "name": "start_time", "type": "u64", "description": "Unix seconds; must be >= current ledger timestamp." },
+            { "name": "end_time", "type": "u64", "description": "Unix seconds; must be > start_time." },
+            { "name": "cliff_time", "type": "u64", "description": "Unix seconds; must be in [start_time, end_time]." },
+            { "name": "label", "type": "String", "description": "Optional descriptor; max 64 bytes." },
+            { "name": "reference", "type": "String", "description": "Optional external id; max 128 bytes." }
+          ],
+          "returns": "Result<u64, StreamError> — the new stream id",
+          "auth": { "required": true, "actor": "sender" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Stream created; tokens transferred sender → contract; id returned.",
+              "precondition": "amount > 0, start_time >= now, end_time > start_time, cliff in range, metadata within length limits",
+              "postcondition": "Stream stored under new id; next_stream_id incremented; sender balance reduced by amount.",
+              "emitsEvent": "(\"stream\", \"created\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "amount is zero or negative.",
+              "errorCode": 1,
+              "errorVariant": "InvalidAmount",
+              "retryable": true,
+              "retryNotes": "Retry with amount > 0."
+            },
+            {
+              "kind": "failure",
+              "description": "end_time <= start_time.",
+              "errorCode": 2,
+              "errorVariant": "InvalidTimeRange",
+              "retryable": true,
+              "retryNotes": "Retry with end_time > start_time."
+            },
+            {
+              "kind": "failure",
+              "description": "cliff_time outside [start_time, end_time].",
+              "errorCode": 3,
+              "errorVariant": "InvalidCliff",
+              "retryable": true,
+              "retryNotes": "Retry with start_time <= cliff_time <= end_time."
+            },
+            {
+              "kind": "failure",
+              "description": "start_time is before the current ledger timestamp.",
+              "errorCode": 12,
+              "errorVariant": "InvalidStartTime",
+              "retryable": true,
+              "retryNotes": "Retry with start_time >= current ledger timestamp. start_time equal to now is accepted."
+            },
+            {
+              "kind": "failure",
+              "description": "label or reference exceeds byte-length cap.",
+              "errorCode": 11,
+              "errorVariant": "MetadataTooLong",
+              "retryable": true,
+              "retryNotes": "Retry with label <= 64 bytes and reference <= 128 bytes."
+            },
+            {
+              "kind": "authorization",
+              "description": "sender.require_auth() fails (missing or wrong signature).",
+              "errorVariant": "Soroban Context error",
+              "retryable": true,
+              "retryNotes": "Resubmit with a valid sender signature."
+            }
+          ]
+        },
+        {
+          "name": "create_streams",
+          "description": "Batch-create up to MAX_BATCH (14) streams in a single all-or-nothing transaction. sender funds every stream and signs once. Streams store empty label and reference strings.",
+          "args": [
+            { "name": "sender", "type": "Address" },
+            { "name": "token", "type": "Address" },
+            { "name": "entries", "type": "Vec<(Address, i128, u64, u64, u64)>", "description": "Each tuple is (recipient, amount, start_time, cliff_time, end_time). Note cliff precedes end, unlike create_stream's argument order." }
+          ],
+          "returns": "Result<Vec<u64>, StreamError> — ids in input order",
+          "auth": { "required": true, "actor": "sender" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "All entries valid; total deposit transferred; each stream stored; ids returned in input order.",
+              "precondition": "1 <= len(entries) <= 14; all individual validations pass; sum of amounts < i128::MAX; id range does not overflow u64.",
+              "postcondition": "N streams stored; next_stream_id advanced by N; one created event per stream.",
+              "emitsEvent": "(\"stream\", \"created\", id) × N"
+            },
+            {
+              "kind": "failure",
+              "description": "entries is empty.",
+              "errorCode": 13,
+              "errorVariant": "EmptyBatch",
+              "retryable": true,
+              "retryNotes": "Provide at least one entry."
+            },
+            {
+              "kind": "failure",
+              "description": "entries has more than 14 items.",
+              "errorCode": 14,
+              "errorVariant": "BatchTooLarge",
+              "retryable": true,
+              "retryNotes": "Split into batches of at most 14."
+            },
+            {
+              "kind": "failure",
+              "description": "Sum of amounts overflows i128, or the resulting id range overflows u64.",
+              "errorCode": 15,
+              "errorVariant": "BatchOverflow",
+              "retryable": true,
+              "retryNotes": "Reduce total amount or split into smaller batches."
+            },
+            {
+              "kind": "failure",
+              "description": "One or more entries fail per-stream validation (amount, time range, cliff, start_time). No streams are created.",
+              "errorCode": null,
+              "errorVariant": "One of InvalidAmount(1), InvalidTimeRange(2), InvalidCliff(3), InvalidStartTime(12)",
+              "retryable": true,
+              "retryNotes": "Fix the failing entry and resubmit. next_stream_id is unchanged."
+            },
+            {
+              "kind": "retry",
+              "description": "Soroban RPC returns a timeout or HTTP 503 before the transaction is confirmed.",
+              "retryable": true,
+              "retryNotes": "Query next_stream_id before retrying. If it has advanced by the batch size the original transaction landed; do not resubmit."
+            }
+          ]
+        },
+        {
+          "name": "withdraw",
+          "description": "Recipient claims all currently vested and unclaimed tokens, net of the protocol fee (if configured).",
+          "args": [
+            { "name": "stream_id", "type": "u64" }
+          ],
+          "returns": "Result<i128, StreamError> — net amount paid to recipient after fee",
+          "auth": { "required": true, "actor": "recipient (the address stored on the stream)" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Claimable amount transferred to recipient; fee (if any) transferred to treasury; withdrawn counter updated.",
+              "precondition": "stream exists; vested(now) - withdrawn > 0; treasury set if fee_bps > 0",
+              "postcondition": "stream.withdrawn increased; recipient balance increased by net amount; treasury balance increased by fee.",
+              "emitsEvent": "(\"stream\", \"withdrawn\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "stream_id does not exist or its persistent entry has expired.",
+              "errorCode": 4,
+              "errorVariant": "StreamNotFound",
+              "retryable": false
+            },
+            {
+              "kind": "failure",
+              "description": "Nothing has vested yet (before cliff, fully withdrawn, or amount is 0).",
+              "errorCode": 5,
+              "errorVariant": "NothingToWithdraw",
+              "retryable": true,
+              "retryNotes": "Retry after cliff_time or when more of the schedule elapses."
+            },
+            {
+              "kind": "failure",
+              "description": "fee_bps is non-zero but no treasury address is stored.",
+              "errorCode": 10,
+              "errorVariant": "TreasuryNotSet",
+              "retryable": false,
+              "retryNotes": "Protocol admin must call set_treasury before any fee-bearing withdrawal."
+            },
+            {
+              "kind": "authorization",
+              "description": "Caller is not the stored recipient.",
+              "errorVariant": "Soroban Context error (require_auth on stored recipient, not caller arg)",
+              "retryable": true,
+              "retryNotes": "Only the stream's recipient address can call withdraw."
+            },
+            {
+              "kind": "retry",
+              "description": "RPC timeout after submission. The transaction may or may not have landed.",
+              "retryable": true,
+              "retryNotes": "Check stream.withdrawn on-chain before resubmitting to avoid a double-submit that returns NothingToWithdraw."
+            }
+          ]
+        },
+        {
+          "name": "cancel",
+          "description": "Sender cancels an active stream. Unvested tokens return to sender; vested-but-unclaimed tokens remain withdrawable by recipient.",
+          "args": [
+            { "name": "stream_id", "type": "u64" }
+          ],
+          "returns": "Result<(), StreamError>",
+          "auth": { "required": true, "actor": "sender (stream.sender)" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Unvested tokens refunded to sender; stream times collapsed to now so the vested remainder is still withdrawable by recipient.",
+              "precondition": "stream exists; cancelled == false",
+              "postcondition": "stream.cancelled = true; stream.total_amount = vested(now); start/end/cliff times = now; sender receives unvested portion.",
+              "emitsEvent": "(\"stream\", \"cancelled\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "Stream does not exist.",
+              "errorCode": 4,
+              "errorVariant": "StreamNotFound",
+              "retryable": false
+            },
+            {
+              "kind": "failure",
+              "description": "Stream was already cancelled.",
+              "errorCode": 8,
+              "errorVariant": "AlreadyCancelled",
+              "retryable": false
+            },
+            {
+              "kind": "authorization",
+              "description": "Only stream.sender may cancel.",
+              "errorVariant": "Soroban Context error",
+              "retryable": true,
+              "retryNotes": "Submit with the original sender's signature."
+            }
+          ]
+        },
+        {
+          "name": "transfer_recipient",
+          "description": "Current recipient hands the stream to a new address (key rotation, sale). The new recipient inherits all unclaimed vested tokens.",
+          "args": [
+            { "name": "stream_id", "type": "u64" },
+            { "name": "caller", "type": "Address", "description": "Must be the current recipient. Signed explicitly to avoid host-level auth traps." },
+            { "name": "new_recipient", "type": "Address" }
+          ],
+          "returns": "Result<(), StreamError>",
+          "auth": { "required": true, "actor": "caller (which must equal stream.recipient)", "notes": "An explicit caller arg is compared against stream.recipient so a mismatch produces SameRecipient or Unauthorized rather than a host trap." },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "stream.recipient updated to new_recipient; withdrawn/schedule untouched. Works on cancelled streams to allow claiming residual vested balance.",
+              "precondition": "stream exists; caller == stream.recipient; new_recipient != stream.recipient",
+              "postcondition": "stream.recipient = new_recipient.",
+              "emitsEvent": "(\"stream\", \"transferred\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "new_recipient is the same as the current recipient.",
+              "errorCode": 20,
+              "errorVariant": "SameRecipient",
+              "retryable": true,
+              "retryNotes": "Provide a different new_recipient address."
+            },
+            {
+              "kind": "failure",
+              "description": "Stream does not exist.",
+              "errorCode": 4,
+              "errorVariant": "StreamNotFound",
+              "retryable": false
+            },
+            {
+              "kind": "authorization",
+              "description": "caller is not the stored recipient (checked after require_auth).",
+              "errorCode": 6,
+              "errorVariant": "Unauthorized",
+              "retryable": true,
+              "retryNotes": "Submit with the actual current recipient's signature."
+            }
+          ]
+        }
+      ],
+      "errorCodes": [
+        { "code": 1,  "variant": "InvalidAmount",      "meaning": "amount <= 0 in create_stream or a create_streams entry.",                      "retryable": true  },
+        { "code": 2,  "variant": "InvalidTimeRange",   "meaning": "end_time <= start_time.",                                                       "retryable": true  },
+        { "code": 3,  "variant": "InvalidCliff",       "meaning": "cliff_time outside [start_time, end_time].",                                    "retryable": true  },
+        { "code": 4,  "variant": "StreamNotFound",     "meaning": "No stream under stream_id; may also mean a persistent entry lapsed its TTL.",   "retryable": false },
+        { "code": 5,  "variant": "NothingToWithdraw",  "meaning": "vested(now) - withdrawn <= 0.",                                                 "retryable": true  },
+        { "code": 6,  "variant": "Unauthorized",       "meaning": "transfer_recipient caller is not the stored recipient. set_fee/set_treasury called without an initialized admin.", "retryable": true },
+        { "code": 7,  "variant": "InvalidFee",         "meaning": "fee_bps > 1000 (the 10% cap).",                                                 "retryable": true  },
+        { "code": 8,  "variant": "AlreadyCancelled",   "meaning": "cancel called on a stream with cancelled == true.",                             "retryable": false },
+        { "code": 9,  "variant": "AlreadyInitialized", "meaning": "initialize called a second time.",                                              "retryable": false },
+        { "code": 10, "variant": "TreasuryNotSet",     "meaning": "withdraw called when fee_bps > 0 but no treasury address is stored.",           "retryable": false },
+        { "code": 11, "variant": "MetadataTooLong",    "meaning": "label > 64 bytes or reference > 128 bytes.",                                    "retryable": true  },
+        { "code": 12, "variant": "InvalidStartTime",   "meaning": "start_time < current ledger timestamp.",                                        "retryable": true  },
+        { "code": 13, "variant": "EmptyBatch",         "meaning": "create_streams called with zero entries.",                                      "retryable": true  },
+        { "code": 14, "variant": "BatchTooLarge",      "meaning": "create_streams batch exceeds MAX_BATCH (14).",                                  "retryable": true  },
+        { "code": 15, "variant": "BatchOverflow",      "meaning": "Sum of batch amounts overflows i128, or id range overflows u64.",               "retryable": true  },
+        { "code": 20, "variant": "SameRecipient",      "meaning": "transfer_recipient with new_recipient == current recipient.",                   "retryable": true  }
+      ],
+      "events": [
+        {
+          "topics": ["stream", "created", "id:u64"],
+          "dataFields": [
+            { "name": "sender",    "type": "Address" },
+            { "name": "recipient", "type": "Address" },
+            { "name": "amount",    "type": "i128"    },
+            { "name": "label",     "type": "String"  },
+            { "name": "reference", "type": "String"  }
+          ],
+          "publishedBy": ["create_stream", "create_streams"],
+          "notes": "One event per stream. For create_streams, events are emitted in input order."
+        },
+        {
+          "topics": ["stream", "withdrawn", "id:u64"],
+          "dataFields": [
+            { "name": "recipient", "type": "Address" },
+            { "name": "amount",    "type": "i128" },
+            { "name": "fee",       "type": "i128" }
+          ],
+          "publishedBy": ["withdraw"],
+          "notes": "amount is the net recipient received; fee is what the treasury received. amount + fee = gross claimable."
+        },
+        {
+          "topics": ["stream", "cancelled", "id:u64"],
+          "dataFields": [
+            { "name": "sender",   "type": "Address" },
+            { "name": "refunded", "type": "i128" }
+          ],
+          "publishedBy": ["cancel"],
+          "notes": "refunded is the unvested portion returned to sender. Recipient's remaining vested amount is still to be withdrawn."
+        },
+        {
+          "topics": ["stream", "transferred", "id:u64"],
+          "dataFields": [
+            { "name": "old_recipient", "type": "Address" },
+            { "name": "new_recipient", "type": "Address" }
+          ],
+          "publishedBy": ["transfer_recipient"]
+        }
+      ],
+      "stateMachine": {
+        "states": [
+          { "name": "active",    "description": "Stream exists, not cancelled, within or before its schedule."  },
+          { "name": "completed", "description": "end_time has passed and all tokens have been withdrawn."       },
+          { "name": "cancelled", "terminal": true, "description": "Sender cancelled; unvested portion refunded." }
+        ],
+        "transitions": [
+          {
+            "from": "none",
+            "to": "active",
+            "trigger": "create_stream / create_streams",
+            "authorizedCallers": ["sender"],
+            "emitsEvent": "(\"stream\", \"created\", id)"
+          },
+          {
+            "from": "active",
+            "to": "active",
+            "trigger": "withdraw",
+            "authorizedCallers": ["recipient"],
+            "precondition": "vested(now) - withdrawn > 0",
+            "errorOnPreconditionFail": 5,
+            "errorVariantOnPreconditionFail": "NothingToWithdraw",
+            "tokenTransfer": "contract → recipient (net), contract → treasury (fee)",
+            "emitsEvent": "(\"stream\", \"withdrawn\", id)"
+          },
+          {
+            "from": "active",
+            "to": "cancelled",
+            "trigger": "cancel",
+            "authorizedCallers": ["sender"],
+            "tokenTransfer": "contract → sender (unvested amount)",
+            "emitsEvent": "(\"stream\", \"cancelled\", id)"
+          }
+        ]
+      }
+    },
+
+    "splits": {
+      "name": "splits",
+      "rustStruct": "SplitsContract",
+      "description": "Immutable proportional payment splits. Anyone may pay into a registered split and tokens distribute immediately. Source of truth: contracts/splits/src/lib.rs.",
+      "entryPoints": [
+        {
+          "name": "create_split",
+          "description": "Register a new split with a list of recipients and their proportional shares (weights, not percentages).",
+          "args": [
+            { "name": "creator",    "type": "Address" },
+            { "name": "recipients", "type": "Vec<Address>" },
+            { "name": "shares",     "type": "Vec<u32>",  "description": "Weights; must be same length as recipients, all > 0, no duplicates, sum <= u32::MAX." }
+          ],
+          "returns": "Result<u64, SplitError> — the new split id",
+          "auth": { "required": true, "actor": "creator" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Split stored; id assigned from NextId counter; id returned.",
+              "postcondition": "Split stored under new id; next_split_id incremented.",
+              "emitsEvent": "(\"splits\", \"created\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "recipients is empty.",
+              "errorCode": 1,
+              "errorVariant": "EmptyRecipients",
+              "retryable": true,
+              "retryNotes": "Provide at least one recipient."
+            },
+            {
+              "kind": "failure",
+              "description": "shares.len() != recipients.len().",
+              "errorCode": 2,
+              "errorVariant": "LengthMismatch",
+              "retryable": true
+            },
+            {
+              "kind": "failure",
+              "description": "Any share is 0.",
+              "errorCode": 3,
+              "errorVariant": "InvalidShares",
+              "retryable": true,
+              "retryNotes": "All shares must be >= 1."
+            },
+            {
+              "kind": "failure",
+              "description": "An address appears more than once in recipients.",
+              "errorCode": 5,
+              "errorVariant": "DuplicateRecipient",
+              "retryable": true,
+              "retryNotes": "Remove duplicate addresses."
+            },
+            {
+              "kind": "failure",
+              "description": "Sum of all shares overflows u32::MAX.",
+              "errorCode": 8,
+              "errorVariant": "ShareOverflow",
+              "retryable": true,
+              "retryNotes": "Reduce share values so the total stays within u32::MAX."
+            }
+          ]
+        },
+        {
+          "name": "distribute",
+          "description": "Pay amount of token into a split. Tokens are distributed to recipients proportionally in a single transaction. The final recipient absorbs rounding dust.",
+          "args": [
+            { "name": "split_id", "type": "u64" },
+            { "name": "from",     "type": "Address", "description": "Must sign; pays the amount." },
+            { "name": "token",    "type": "Address" },
+            { "name": "amount",   "type": "i128" }
+          ],
+          "returns": "Result<(), SplitError>",
+          "auth": { "required": true, "actor": "from", "notes": "InvalidAmount is checked before require_auth so an amount validation failure does not trigger a wallet prompt." },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "1 + N token transfers (from → contract, contract → each recipient). Final recipient absorbs dust.",
+              "precondition": "amount > 0; split_id exists",
+              "postcondition": "Each recipient's balance increased by their proportional share; from's balance reduced by amount.",
+              "emitsEvent": "(\"splits\", \"distrib\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "amount <= 0. Checked before auth and split lookup.",
+              "errorCode": 4,
+              "errorVariant": "InvalidAmount",
+              "retryable": true
+            },
+            {
+              "kind": "failure",
+              "description": "split_id not found or its persistent entry expired.",
+              "errorCode": 6,
+              "errorVariant": "SplitNotFound",
+              "retryable": false
+            },
+            {
+              "kind": "authorization",
+              "description": "from.require_auth() fails.",
+              "errorVariant": "Soroban Context error",
+              "retryable": true,
+              "retryNotes": "Resubmit with from's valid signature."
+            },
+            {
+              "kind": "retry",
+              "description": "RPC timeout after submission.",
+              "retryable": true,
+              "retryNotes": "Check from's balance and each recipient's balance to determine if the transaction landed before resubmitting."
+            }
+          ]
+        }
+      ],
+      "errorCodes": [
+        { "code": 1, "variant": "EmptyRecipients",          "meaning": "create_split with an empty recipients list.",                   "retryable": true  },
+        { "code": 2, "variant": "LengthMismatch",           "meaning": "shares.len() != recipients.len().",                            "retryable": true  },
+        { "code": 3, "variant": "InvalidShares",            "meaning": "Any share is 0.",                                              "retryable": true  },
+        { "code": 4, "variant": "InvalidAmount",            "meaning": "distribute or recipient_share with amount <= 0.",              "retryable": true  },
+        { "code": 5, "variant": "DuplicateRecipient",       "meaning": "An address appears more than once in recipients.",             "retryable": true  },
+        { "code": 6, "variant": "SplitNotFound",            "meaning": "split_id unregistered or its persistent entry has expired.",   "retryable": false },
+        { "code": 7, "variant": "Unauthorized",             "meaning": "Defined but never returned by this contract.",                 "retryable": false, "retired": true },
+        { "code": 8, "variant": "ShareOverflow",            "meaning": "Sum of all shares exceeds u32::MAX.",                         "retryable": true  },
+        { "code": 9, "variant": "RecipientIndexOutOfBounds","meaning": "recipient_share index not in [0, recipients.len()).",          "retryable": true  }
+      ],
+      "events": [
+        {
+          "topics": ["splits", "created", "id:u64"],
+          "dataFields": [
+            { "name": "creator",      "type": "Address" },
+            { "name": "total_shares", "type": "u32"     }
+          ],
+          "publishedBy": ["create_split"]
+        },
+        {
+          "topics": ["splits", "distrib", "id:u64"],
+          "dataFields": [
+            { "name": "from",   "type": "Address" },
+            { "name": "token",  "type": "Address" },
+            { "name": "amount", "type": "i128"    }
+          ],
+          "publishedBy": ["distribute"],
+          "notes": "Topic symbol is 'distrib' (9 chars max). One event per distribute call even though N+1 token transfers occur."
+        }
+      ],
+      "stateMachine": {
+        "states": [
+          { "name": "none",       "description": "Split not yet created." },
+          { "name": "registered", "description": "Split stored; can receive payments indefinitely. No terminal state — splits are immutable once created." }
+        ],
+        "transitions": [
+          {
+            "from": "none",
+            "to": "registered",
+            "trigger": "create_split",
+            "authorizedCallers": ["creator"],
+            "emitsEvent": "(\"splits\", \"created\", id)"
+          },
+          {
+            "from": "registered",
+            "to": "registered",
+            "trigger": "distribute",
+            "authorizedCallers": ["any (from)"],
+            "tokenTransfer": "from → contract (amount), then contract → each recipient",
+            "emitsEvent": "(\"splits\", \"distrib\", id)"
+          }
+        ]
+      }
+    },
+
+    "escrow": {
+      "name": "escrow",
+      "rustStruct": "EscrowContract",
+      "description": "Three-party (payer, payee, arbiter) escrow with deadline-driven cancellation and optional milestone schedule. Source of truth: contracts/escrow/src/lib.rs.",
+      "entryPoints": [
+        {
+          "name": "create_escrow",
+          "description": "Create a new escrow agreement. The contract auto-assigns the id from an instance-storage counter.",
+          "args": [
+            { "name": "payer",    "type": "Address" },
+            { "name": "payee",    "type": "Address" },
+            { "name": "arbiter",  "type": "Address" },
+            { "name": "token",    "type": "Address" },
+            { "name": "amount",   "type": "i128",  "description": "Must be > 0." },
+            { "name": "deadline", "type": "u64",   "description": "Unix seconds; must be > current ledger timestamp." }
+          ],
+          "returns": "Result<u64, EscrowError> — the new escrow id",
+          "auth": { "required": true, "actor": "payer" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Escrow stored with status Created; id assigned; NextId counter incremented; instance TTL bumped.",
+              "precondition": "amount > 0; deadline > current ledger timestamp",
+              "postcondition": "Escrow stored under new id with status Created; next_escrow_id incremented.",
+              "emitsEvent": "(\"escrow\", \"created\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "amount <= 0.",
+              "errorCode": 3,
+              "errorVariant": "InvalidAmount",
+              "retryable": true,
+              "retryNotes": "Retry with amount > 0. Checked before payer auth."
+            },
+            {
+              "kind": "failure",
+              "description": "deadline is not in the future.",
+              "errorCode": 9,
+              "errorVariant": "InvalidDeadline",
+              "retryable": true,
+              "retryNotes": "Retry with deadline > current ledger timestamp."
+            },
+            {
+              "kind": "authorization",
+              "description": "payer.require_auth() fails.",
+              "errorVariant": "Soroban Context error",
+              "retryable": true,
+              "retryNotes": "Resubmit with payer's valid signature."
+            }
+          ]
+        },
+        {
+          "name": "fund_escrow",
+          "description": "Payer locks tokens into the escrow contract, moving it to Funded state.",
+          "args": [
+            { "name": "id", "type": "u64" }
+          ],
+          "returns": "Result<(), EscrowError>",
+          "auth": { "required": true, "actor": "payer (escrow.payer)" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "escrow.amount transferred payer → contract; status becomes Funded.",
+              "precondition": "escrow.status == Created",
+              "postcondition": "escrow.status = Funded; payer's token balance reduced by amount.",
+              "emitsEvent": "(\"escrow\", \"funded\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow id does not exist.",
+              "errorCode": 1,
+              "errorVariant": "EscrowNotFound",
+              "retryable": false
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow is not in Created state (already funded or finalized).",
+              "errorCode": 5,
+              "errorVariant": "InvalidStateTransition",
+              "retryable": false
+            },
+            {
+              "kind": "authorization",
+              "description": "Only escrow.payer may fund.",
+              "errorVariant": "Soroban Context error",
+              "retryable": true,
+              "retryNotes": "Submit with the payer's signature."
+            },
+            {
+              "kind": "retry",
+              "description": "RPC timeout after fund_escrow submission.",
+              "retryable": true,
+              "retryNotes": "Call get_escrow(id) to check status before resubmitting. If status == Funded the original transaction landed."
+            }
+          ]
+        },
+        {
+          "name": "release_escrow",
+          "description": "Release the full escrowed amount to the payee. Authorized by payer or arbiter. Blocked if a milestone schedule is attached (use release_milestone instead).",
+          "args": [
+            { "name": "id",     "type": "u64"     },
+            { "name": "caller", "type": "Address", "description": "Must be payer or arbiter; must sign." }
+          ],
+          "returns": "Result<(), EscrowError>",
+          "auth": { "required": true, "actor": "caller (payer or arbiter)", "notes": "caller is an explicit argument compared against stored roles after caller.require_auth() — a mismatch fails with UnauthorizedOperation, not a host trap." },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Full amount transferred contract → payee; status becomes Released.",
+              "precondition": "escrow.status == Funded; caller in {payer, arbiter}; no milestone schedule attached",
+              "postcondition": "escrow.status = Released; payee's balance increased by amount.",
+              "emitsEvent": "(\"escrow\", \"released\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow not found.",
+              "errorCode": 1,
+              "errorVariant": "EscrowNotFound",
+              "retryable": false
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow is not Funded (still Created — tokens not yet locked).",
+              "errorCode": 5,
+              "errorVariant": "InvalidStateTransition",
+              "retryable": false,
+              "retryNotes": "Call fund_escrow first."
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow is already in a terminal state (Released, Refunded, or Cancelled).",
+              "errorCode": 8,
+              "errorVariant": "AlreadyFinalized",
+              "retryable": false
+            },
+            {
+              "kind": "authorization",
+              "description": "caller is neither payer nor arbiter.",
+              "errorCode": 4,
+              "errorVariant": "UnauthorizedOperation",
+              "retryable": true,
+              "retryNotes": "Resubmit with payer's or arbiter's signature."
+            }
+          ]
+        },
+        {
+          "name": "refund_escrow",
+          "description": "Refund the remaining amount (total minus already-released milestones) to the payer. Authorized by payee or arbiter.",
+          "args": [
+            { "name": "id",     "type": "u64"     },
+            { "name": "caller", "type": "Address" }
+          ],
+          "returns": "Result<(), EscrowError>",
+          "auth": { "required": true, "actor": "caller (payee or arbiter)" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Refundable amount (total minus milestone payouts) returned to payer; status becomes Refunded.",
+              "precondition": "escrow.status == Funded; caller in {payee, arbiter}",
+              "postcondition": "escrow.status = Refunded; payer's balance increased by refundable amount.",
+              "emitsEvent": "(\"escrow\", \"refunded\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow not in Funded state.",
+              "errorCode": 5,
+              "errorVariant": "InvalidStateTransition",
+              "retryable": false,
+              "retryNotes": "Created → Funded required; Refunded on a Created escrow returns InvalidStateTransition."
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow already finalized.",
+              "errorCode": 8,
+              "errorVariant": "AlreadyFinalized",
+              "retryable": false
+            },
+            {
+              "kind": "authorization",
+              "description": "caller is neither payee nor arbiter.",
+              "errorCode": 4,
+              "errorVariant": "UnauthorizedOperation",
+              "retryable": true,
+              "retryNotes": "Resubmit with payee's or arbiter's signature."
+            }
+          ]
+        },
+        {
+          "name": "cancel_escrow",
+          "description": "Payer cancels the escrow. If unfunded (Created), the escrow is dropped with no token transfer. If funded (Funded), cancellation is only possible after the deadline.",
+          "args": [
+            { "name": "id",     "type": "u64"     },
+            { "name": "caller", "type": "Address", "description": "Must be escrow.payer." }
+          ],
+          "returns": "Result<(), EscrowError>",
+          "auth": { "required": true, "actor": "caller (must be payer)" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Created → Cancelled with no token transfer.",
+              "precondition": "escrow.status == Created; caller == payer",
+              "postcondition": "escrow.status = Cancelled.",
+              "emitsEvent": "(\"escrow\", \"cancelled\", id)"
+            },
+            {
+              "kind": "normal",
+              "description": "Funded → Cancelled after deadline; payer receives remaining funds.",
+              "precondition": "escrow.status == Funded; ledger.timestamp() >= deadline; caller == payer",
+              "postcondition": "escrow.status = Cancelled; payer's balance increased by refundable amount.",
+              "emitsEvent": "(\"escrow\", \"cancelled\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow not found.",
+              "errorCode": 1,
+              "errorVariant": "EscrowNotFound",
+              "retryable": false
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow is Funded and the deadline has not yet passed.",
+              "errorCode": 6,
+              "errorVariant": "DeadlineNotReached",
+              "retryable": true,
+              "retryNotes": "Wait until ledger.timestamp() >= escrow.deadline then resubmit."
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow already in a terminal state.",
+              "errorCode": 8,
+              "errorVariant": "AlreadyFinalized",
+              "retryable": false
+            },
+            {
+              "kind": "authorization",
+              "description": "Only payer may cancel.",
+              "errorCode": 4,
+              "errorVariant": "UnauthorizedOperation",
+              "retryable": true,
+              "retryNotes": "Resubmit with escrow.payer's signature."
+            }
+          ]
+        },
+        {
+          "name": "set_milestones",
+          "description": "Attach a milestone payment schedule to an unfunded escrow. Amounts must all be positive and sum exactly to escrow.amount. Requires at least 2 milestones. Only payer may call.",
+          "args": [
+            { "name": "id",      "type": "u64"           },
+            { "name": "caller",  "type": "Address"        },
+            { "name": "amounts", "type": "Vec<i128>",     "description": "Must have >= 2 entries; all > 0; sum == escrow.amount." }
+          ],
+          "returns": "Result<(), EscrowError>",
+          "auth": { "required": true, "actor": "caller (payer)" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Milestone schedule stored; each milestone starts as unreleased.",
+              "precondition": "escrow.status == Created; caller == payer; amounts.len() >= 2; all positive; sum == escrow.amount",
+              "postcondition": "DataKey::Milestones(id) and DataKey::MilestoneReleased(id) written.",
+              "emitsEvent": "none"
+            },
+            {
+              "kind": "failure",
+              "description": "Milestone schedule is invalid (< 2 entries, any entry <= 0, or sum != escrow.amount).",
+              "errorCode": 13,
+              "errorVariant": "MilestoneScheduleInvalid",
+              "retryable": true
+            },
+            {
+              "kind": "failure",
+              "description": "Escrow not in Created state (already funded or finalized).",
+              "errorCode": 5,
+              "errorVariant": "InvalidStateTransition",
+              "retryable": false
+            }
+          ]
+        },
+        {
+          "name": "release_milestone",
+          "description": "Release one milestone share to the payee. Payer or arbiter only. The final milestone sets status to Released.",
+          "args": [
+            { "name": "id",              "type": "u64"     },
+            { "name": "milestone_index", "type": "u32"     },
+            { "name": "caller",          "type": "Address" }
+          ],
+          "returns": "Result<(), EscrowError>",
+          "auth": { "required": true, "actor": "caller (payer or arbiter)" },
+          "paths": [
+            {
+              "kind": "normal",
+              "description": "Milestone amount transferred contract → payee; milestone flagged as released. Final milestone sets status to Released.",
+              "precondition": "escrow.status == Funded; milestone_index in range; milestone not yet released; deadline not passed",
+              "postcondition": "payee receives milestone amount; milestone flag set; if all released → status = Released.",
+              "emitsEvent": "(\"escrow\", \"milestone_released\", id)"
+            },
+            {
+              "kind": "failure",
+              "description": "No milestone schedule attached.",
+              "errorCode": 10,
+              "errorVariant": "MilestoneScheduleNotFound",
+              "retryable": false
+            },
+            {
+              "kind": "failure",
+              "description": "milestone_index >= milestones.len().",
+              "errorCode": 11,
+              "errorVariant": "MilestoneIndexOutOfRange",
+              "retryable": true
+            },
+            {
+              "kind": "failure",
+              "description": "Milestone at milestone_index already released.",
+              "errorCode": 12,
+              "errorVariant": "MilestoneAlreadyReleased",
+              "retryable": false
+            },
+            {
+              "kind": "authorization",
+              "description": "caller is neither payer nor arbiter.",
+              "errorCode": 4,
+              "errorVariant": "UnauthorizedOperation",
+              "retryable": true
+            }
+          ]
+        }
+      ],
+      "errorCodes": [
+        { "code": 1,  "variant": "EscrowNotFound",            "meaning": "No escrow under id.",                                                              "retryable": false },
+        { "code": 2,  "variant": "EscrowAlreadyExists",       "meaning": "RETIRED — discriminant reserved but never returned. Creation no longer collides.", "retryable": false, "retired": true },
+        { "code": 3,  "variant": "InvalidAmount",             "meaning": "create_escrow with amount <= 0.",                                                   "retryable": true  },
+        { "code": 4,  "variant": "UnauthorizedOperation",     "meaning": "In-contract role mismatch after require_auth succeeded.",                            "retryable": true  },
+        { "code": 5,  "variant": "InvalidStateTransition",    "meaning": "Transition not allowed from current state.",                                         "retryable": false },
+        { "code": 6,  "variant": "DeadlineNotReached",        "meaning": "cancel_escrow on Funded before deadline.",                                           "retryable": true  },
+        { "code": 7,  "variant": "DeadlineExpired",           "meaning": "DEFINED BUT NEVER RETURNED. A passed deadline never locks release/refund.",          "retryable": false, "retired": true },
+        { "code": 8,  "variant": "AlreadyFinalized",          "meaning": "Escrow is in a terminal state.",                                                     "retryable": false },
+        { "code": 9,  "variant": "InvalidDeadline",           "meaning": "deadline <= current ledger timestamp.",                                              "retryable": true  },
+        { "code": 10, "variant": "MilestoneScheduleNotFound", "meaning": "release_milestone called but no schedule attached.",                                 "retryable": false },
+        { "code": 11, "variant": "MilestoneIndexOutOfRange",  "meaning": "milestone_index >= milestones.len().",                                               "retryable": true  },
+        { "code": 12, "variant": "MilestoneAlreadyReleased",  "meaning": "Milestone at index already released.",                                               "retryable": false },
+        { "code": 13, "variant": "MilestoneScheduleInvalid",  "meaning": "Invalid schedule: < 2 entries, any <= 0, or sum != escrow.amount.",                  "retryable": true  }
+      ],
+      "events": [
+        {
+          "topics": ["escrow", "created", "id:u64"],
+          "dataFields": [
+            { "name": "payer",  "type": "Address" },
+            { "name": "amount", "type": "i128"    }
+          ],
+          "publishedBy": ["create_escrow"]
+        },
+        {
+          "topics": ["escrow", "funded", "id:u64"],
+          "dataFields": [
+            { "name": "amount", "type": "i128" }
+          ],
+          "publishedBy": ["fund_escrow"]
+        },
+        {
+          "topics": ["escrow", "released", "id:u64"],
+          "dataFields": [
+            { "name": "caller", "type": "Address" },
+            { "name": "payee",  "type": "Address" },
+            { "name": "amount", "type": "i128"    }
+          ],
+          "publishedBy": ["release_escrow"],
+          "notes": "caller + payee are both present so an indexer can tell who authorized and who received."
+        },
+        {
+          "topics": ["escrow", "refunded", "id:u64"],
+          "dataFields": [
+            { "name": "caller", "type": "Address" },
+            { "name": "payer",  "type": "Address" },
+            { "name": "amount", "type": "i128"    }
+          ],
+          "publishedBy": ["refund_escrow"]
+        },
+        {
+          "topics": ["escrow", "cancelled", "id:u64"],
+          "dataFields": [
+            { "name": "payer", "type": "Address" }
+          ],
+          "publishedBy": ["cancel_escrow"],
+          "notes": "No amount field. Fires for both Created→Cancelled (no transfer) and Funded→Cancelled (refund). Read the stored amount or token transfers to determine which case."
+        },
+        {
+          "topics": ["escrow", "milestone_released", "id:u64"],
+          "dataFields": [
+            { "name": "index",  "type": "u32"     },
+            { "name": "caller", "type": "Address" },
+            { "name": "payee",  "type": "Address" },
+            { "name": "amount", "type": "i128"    }
+          ],
+          "publishedBy": ["release_milestone"]
+        }
+      ],
+      "stateMachine": {
+        "states": [
+          { "name": "none",      "description": "Escrow not yet created." },
+          { "name": "Created",   "description": "Agreement recorded; no tokens locked." },
+          { "name": "Funded",    "description": "Tokens locked in contract." },
+          { "name": "Released",  "terminal": true, "description": "Funds disbursed to payee." },
+          { "name": "Refunded",  "terminal": true, "description": "Funds returned to payer." },
+          { "name": "Cancelled", "terminal": true, "description": "Escrow cancelled; funds returned to payer if Funded." }
+        ],
+        "transitions": [
+          {
+            "from": "none",
+            "to": "Created",
+            "trigger": "create_escrow",
+            "authorizedCallers": ["payer"],
+            "precondition": "amount > 0; deadline > now",
+            "errorOnPreconditionFail": 3,
+            "errorVariantOnPreconditionFail": "InvalidAmount / InvalidDeadline",
+            "emitsEvent": "(\"escrow\", \"created\", id)"
+          },
+          {
+            "from": "Created",
+            "to": "Funded",
+            "trigger": "fund_escrow",
+            "authorizedCallers": ["payer"],
+            "tokenTransfer": "payer → contract (escrow.amount)",
+            "emitsEvent": "(\"escrow\", \"funded\", id)"
+          },
+          {
+            "from": "Created",
+            "to": "Cancelled",
+            "trigger": "cancel_escrow",
+            "authorizedCallers": ["payer"],
+            "precondition": "always (unfunded, no token transfer needed)",
+            "emitsEvent": "(\"escrow\", \"cancelled\", id)"
+          },
+          {
+            "from": "Funded",
+            "to": "Released",
+            "trigger": "release_escrow",
+            "authorizedCallers": ["payer", "arbiter"],
+            "precondition": "no milestone schedule attached",
+            "tokenTransfer": "contract → payee (amount)",
+            "emitsEvent": "(\"escrow\", \"released\", id)"
+          },
+          {
+            "from": "Funded",
+            "to": "Refunded",
+            "trigger": "refund_escrow",
+            "authorizedCallers": ["payee", "arbiter"],
+            "tokenTransfer": "contract → payer (refundable amount)",
+            "emitsEvent": "(\"escrow\", \"refunded\", id)"
+          },
+          {
+            "from": "Funded",
+            "to": "Cancelled",
+            "trigger": "cancel_escrow",
+            "authorizedCallers": ["payer"],
+            "precondition": "ledger.timestamp() >= deadline",
+            "errorOnPreconditionFail": 6,
+            "errorVariantOnPreconditionFail": "DeadlineNotReached",
+            "tokenTransfer": "contract → payer (refundable amount)",
+            "emitsEvent": "(\"escrow\", \"cancelled\", id)"
+          }
+        ]
+      }
+    }
+  }
+}
